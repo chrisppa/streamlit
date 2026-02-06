@@ -308,14 +308,14 @@ def main():
                 
                 progress_bar.progress(1.0, text="Finished!")
                 st.success(f"Processing Complete! Added: {inserted} | Skipped: {skipped}")
-                    
-                    with st.expander("View Processing Logs"):
-                        for log in logs:
-                            st.write(log)
-                    
-                    # Force reload of data in Tab 1
-                    load_table.clear()
-                    st.rerun()
+                
+                with st.expander("View Processing Logs"):
+                    for log in logs:
+                        st.write(log)
+                
+                # Force reload of data in Tab 1
+                load_table.clear()
+                st.rerun()
 
         st.divider()
         st.subheader("Download Updated Database")
