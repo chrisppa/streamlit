@@ -1,5 +1,6 @@
 import os
 import sqlite3
+import tempfile
 from datetime import date, datetime, timedelta
 
 import pandas as pd
@@ -53,12 +54,28 @@ def main():
     default_table = os.getenv("TABLE_NAME", "EfrisPdfReport")
 
     st.sidebar.header("Connection")
-    db_path = st.sidebar.text_input(
-        "SQLite database path",
+    
+    # 1. Option to upload file
+    uploaded_file = st.sidebar.file_uploader("Upload SQLite DB", type=["db", "sqlite", "sqlite3"])
+    
+    # 2. Option to specify path (fallback)
+    db_path_input = st.sidebar.text_input(
+        "Or enter server-side path",
         value=default_db,
         placeholder="/path/to/EFRIS PDF Report.db",
-        help="Enter the full path to your .db file",
+        help="Enter the full path to your .db file if it exists on the server",
     )
+    
+    # Determine which path to use
+    db_path = None
+    if uploaded_file:
+        # Save to a temporary file
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".db") as tmp:
+            tmp.write(uploaded_file.getvalue())
+            db_path = tmp.name
+    elif db_path_input:
+        db_path = db_path_input
+
     table_name = st.sidebar.text_input("Table name", value=default_table)
 
     st.sidebar.header("Filters")
@@ -78,12 +95,12 @@ def main():
 
     err = None
     if not db_path:
-        err = "Enter a database path to continue."
+        err = "Upload a database file or enter a path to continue."
     elif not os.path.isfile(db_path):
         err = f"Database not found at: {db_path}"
 
     if err:
-        st.info("Provide a valid database path in the sidebar to load data.")
+        st.info("Provide a valid database in the sidebar to load data.")
         st.stop()
 
     try:
