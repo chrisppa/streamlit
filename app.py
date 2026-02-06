@@ -144,6 +144,13 @@ def process_pdfs_and_update_db(db_path, uploaded_pdfs):
             amount_assessed
         )
 
+        # Check for existing record manually (safeguard for DBs without UNIQUE constraint)
+        cursor.execute('SELECT 1 FROM "EfrisPdfReport" WHERE "Assessment Number" = ?', (assessment_no,))
+        if cursor.fetchone():
+            logs.append(f"ℹ️ {pdf_file.name}: Skipped (Assessment {assessment_no} already exists).")
+            skipped_count += 1
+            continue
+
         try:
             cursor.execute("""
                 INSERT INTO "EfrisPdfReport" (
@@ -154,9 +161,6 @@ def process_pdfs_and_update_db(db_path, uploaded_pdfs):
             """, record)
             inserted_count += 1
             logs.append(f"✅ {pdf_file.name}: Added (Assessment {assessment_no})")
-        except sqlite3.IntegrityError:
-            logs.append(f"ℹ️ {pdf_file.name}: Duplicate (Assessment {assessment_no} already exists).")
-            skipped_count += 1
         except Exception as e:
             logs.append(f"❌ {pdf_file.name}: Error inserting - {str(e)}")
             skipped_count += 1
