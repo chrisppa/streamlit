@@ -1,11 +1,15 @@
 import os
 import sqlite3
 import tempfile
+import re
+import shutil
 from datetime import date, datetime, timedelta
+from io import BytesIO
 
 import pandas as pd
 from urllib.parse import quote
 import streamlit as st
+from PyPDF2 import PdfReader
 
 # Optional: load .env if available
 try:
@@ -15,182 +19,306 @@ except Exception:
     pass
 
 
-st.set_page_config(page_title="EFRIS PDF Report Viewer", layout="wide")
+st.set_page_config(page_title="EFRIS Report Manager", layout="wide")
 
+# --- 1. Database & Extraction Logic (Backend) ---
+
+def init_db(conn):
+    """Ensure the table exists if starting from scratch."""
+    cursor = conn.cursor()
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS "EfrisPdfReport" (
+            "TIN" TEXT,
+            "Taxpayer Name" TEXT,
+            "Region" TEXT,
+            "Location" TEXT,
+            "Risk Source" TEXT,
+            "Risk" TEXT,
+            "Activity" TEXT,
+            "Activity Date" TEXT,
+            "Tax Head" TEXT,
+            "Assessment Number" TEXT UNIQUE,
+            "Amount Assessed" REAL
+        )
+    """)
+    conn.commit()
+
+def extract_text_from_pdf(file_obj):
+    """Extract text from a PDF file object (uploaded file)."""
+    try:
+        reader = PdfReader(file_obj)
+        text = ""
+        for page in reader.pages:
+            text += page.extract_text() or ""
+        return text
+    except Exception as e:
+        return ""
+
+def extract_data_from_text(text):
+    """Parse text using regex patterns from original script."""
+    data = {
+        "TIN": "N/A",
+        "Taxpayer Name": "N/A",
+        "Activity Date": "N/A",
+        "Assessment Number": "N/A",
+        "Amount Assessed": "N/A"
+    }
+    
+    # TIN
+    tin_match = re.search(r'TIN\s*[:\-\s]*(\d{9,15})', text, re.IGNORECASE)
+    if tin_match:
+        data["TIN"] = tin_match.group(1).strip()
+    
+    # Trade Name
+    tradeName_match = re.search(r'Trade\s*Name\s*[:\s-]*([a-zA-Z0-9\s&,.-]+?)(?=\s*Address|\Z)', text, re.IGNORECASE)
+    if tradeName_match:
+        data["Taxpayer Name"] = tradeName_match.group(1).strip()
+
+    # Issued Date
+    date_match = re.search(r'Issued\s*Date[:\s]*(\d{1,2}/\d{1,2}/\d{2,4})', text, re.IGNORECASE)
+    if date_match:
+        data["Activity Date"] = date_match.group(1).strip()
+        
+    # FDN / Assessment Number
+    fdn_match = re.search(r'Fiscal\s*Document\s*Number[:\-\s]*(\d{13,20})', text, re.IGNORECASE)
+    if fdn_match:
+        data["Assessment Number"] = fdn_match.group(1).strip()
+
+    # Net Amount
+    tax_match = re.search(r'Tax\s*Amount\s*[:\s]*(\d{1,3}(?:,\d{3})*(?:\.\d{4})?)', text, re.IGNORECASE)
+    if tax_match:
+        data["Amount Assessed"] = tax_match.group(1).strip()
+    
+    return data
+
+def process_pdfs_and_update_db(db_path, uploaded_pdfs):
+    """
+    Process list of uploaded PDF files, extract data, and insert into DB.
+    Returns: (count_inserted, count_skipped, logs)
+    """
+    conn = sqlite3.connect(db_path)
+    init_db(conn) # Ensure table exists
+    cursor = conn.cursor()
+    
+    inserted_count = 0
+    skipped_count = 0
+    logs = []
+
+    for pdf_file in uploaded_pdfs:
+        text = extract_text_from_pdf(pdf_file)
+        if not text:
+            logs.append(f"❌ {pdf_file.name}: Could not extract text.")
+            skipped_count += 1
+            continue
+
+        data_row = extract_data_from_text(text)
+        assessment_no = data_row.get('Assessment Number', 'N/A')
+
+        # Skip invalid or missing assessment numbers
+        if assessment_no == 'N/A' or not assessment_no.strip():
+            logs.append(f"⚠️ {pdf_file.name}: Skipped (No Assessment Number found).")
+            skipped_count += 1
+            continue
+
+        # Convert Amount
+        raw_val = data_row.get('Amount Assessed', 'N/A')
+        amount_assessed = None
+        if raw_val != 'N/A' and raw_val:
+            try:
+                amount_assessed = float(raw_val.replace(',', ''))
+            except ValueError:
+                amount_assessed = None
+
+        # Prepare Tuple
+        record = (
+            data_row['TIN'],
+            data_row['Taxpayer Name'],
+            "South Western",    # Region
+            "",                 # Location
+            "Field Surveillance", # Risk Source
+            "",                 # Risk
+            "EFRIS Inspection/Spot Check", # Activity
+            data_row['Activity Date'],
+            "VAT",              # Tax Head
+            assessment_no,
+            amount_assessed
+        )
+
+        try:
+            cursor.execute("""
+                INSERT INTO "EfrisPdfReport" (
+                    "TIN", "Taxpayer Name", "Region", "Location", 
+                    "Risk Source", "Risk", "Activity", "Activity Date", 
+                    "Tax Head", "Assessment Number", "Amount Assessed"
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, record)
+            inserted_count += 1
+            logs.append(f"✅ {pdf_file.name}: Added (Assessment {assessment_no})")
+        except sqlite3.IntegrityError:
+            logs.append(f"ℹ️ {pdf_file.name}: Duplicate (Assessment {assessment_no} already exists).")
+            skipped_count += 1
+        except Exception as e:
+            logs.append(f"❌ {pdf_file.name}: Error inserting - {str(e)}")
+            skipped_count += 1
+
+    conn.commit()
+    conn.close()
+    return inserted_count, skipped_count, logs
+
+
+# --- 2. Helper Functions (Frontend) ---
 
 @st.cache_data(show_spinner=False)
 def load_table(db_path: str, table_name: str) -> pd.DataFrame:
-    """Read the full table from SQLite in read-only mode.
-
-    Uses pandas for convenience and returns a DataFrame.
-    """
-    # Enforce read-only connection
     uri = f"file:{quote(db_path, safe='/')}?mode=ro"
-    with sqlite3.connect(uri, uri=True) as conn:
-        df = pd.read_sql_query(f'SELECT * FROM "{table_name}"', conn)
-    return df
-
+    try:
+        with sqlite3.connect(uri, uri=True) as conn:
+            df = pd.read_sql_query(f'SELECT * FROM "{table_name}"', conn)
+        return df
+    except Exception:
+        return pd.DataFrame()
 
 def coerce_dates(series: pd.Series) -> pd.Series:
-    """Convert a date-like text series to pandas datetime (day-first tolerant)."""
-    # Try common formats quickly, then fall back to to_datetime with dayfirst
-    s = pd.to_datetime(series, errors="coerce", dayfirst=True, infer_datetime_format=True)
-    return s
-
+    return pd.to_datetime(series, errors="coerce", dayfirst=True)
 
 def coerce_amount(series: pd.Series) -> pd.Series:
-    """Convert amount-like text to numeric, stripping commas."""
     if series.dtype == object:
         return pd.to_numeric(series.str.replace(",", "", regex=False), errors="coerce")
     return pd.to_numeric(series, errors="coerce")
 
 
+# --- 3. Main Application ---
+
 def main():
-    st.title("EFRIS PDF Report Viewer")
-    st.caption("Browse and export records from your local SQLite database.")
-
-    # Sidebar configuration
-    default_db = os.getenv("DB_FILEPATH", "")
-    default_table = os.getenv("TABLE_NAME", "EfrisPdfReport")
-
-    st.sidebar.header("Connection")
+    st.title("EFRIS Report Manager")
     
-    # 1. Option to upload file
-    uploaded_file = st.sidebar.file_uploader("Upload SQLite DB", type=["db", "sqlite", "sqlite3"])
+    # Sidebar: Database Selection
+    st.sidebar.header("1. Connect Database")
     
-    # 2. Option to specify path (fallback)
-    db_path_input = st.sidebar.text_input(
-        "Or enter server-side path",
-        value=default_db,
-        placeholder="/path/to/EFRIS PDF Report.db",
-        help="Enter the full path to your .db file if it exists on the server",
-    )
+    # Initialize session state for the database path if not present
+    if "db_path" not in st.session_state:
+        st.session_state["db_path"] = None
+    if "temp_db_file" not in st.session_state:
+        st.session_state["temp_db_file"] = None
+
+    uploaded_db = st.sidebar.file_uploader("Upload current DB (Optional)", type=["db", "sqlite"], key="db_uploader")
     
-    # Determine which path to use
-    db_path = None
-    if uploaded_file:
-        # Save to a temporary file
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".db") as tmp:
-            tmp.write(uploaded_file.getvalue())
-            db_path = tmp.name
-    elif db_path_input:
-        db_path = db_path_input
+    # Handle DB upload
+    if uploaded_db:
+        # If a new file is uploaded, save it to a temp file
+        if st.session_state["temp_db_file"] is None:
+            tfile = tempfile.NamedTemporaryFile(delete=False, suffix=".db")
+            tfile.write(uploaded_db.getvalue())
+            tfile.close()
+            st.session_state["temp_db_file"] = tfile.name
+            st.session_state["db_path"] = tfile.name
+            st.toast("Database loaded successfully!")
 
-    table_name = st.sidebar.text_input("Table name", value=default_table)
+    # Fallback to local file if no upload (for local testing)
+    if not st.session_state["db_path"]:
+        default_db = os.getenv("DB_FILEPATH", "EFRIS PDF Report.db")
+        if os.path.exists(default_db):
+            st.session_state["db_path"] = default_db
 
-    st.sidebar.header("Filters")
-    today = date.today()
-    default_start = today - timedelta(days=30)
-    date_range = st.sidebar.date_input(
-        "Activity Date range",
-        value=[default_start, today],
-        format="DD/MM/YYYY",
-        help="Select From and To dates (inclusive)",
-    )
+    db_path = st.session_state["db_path"]
+    table_name = "EfrisPdfReport"
 
-    # Optional quick filters
-    with st.sidebar.expander("More filters (optional)"):
-        tin_filter = st.text_input("TIN contains", value="")
-        assess_filter = st.text_input("Assessment Number contains", value="")
-
-    err = None
     if not db_path:
-        err = "Upload a database file or enter a path to continue."
-    elif not os.path.isfile(db_path):
-        err = f"Database not found at: {db_path}"
-
-    if err:
-        st.info("Provide a valid database in the sidebar to load data.")
+        st.warning("👈 Please upload a database file to start.")
         st.stop()
 
-    try:
+    # Tabs for main functionality
+    tab_view, tab_update = st.tabs(["📊 View Reports", "📥 Update from PDFs"])
+
+    # --- TAB 1: VIEW DATA ---
+    with tab_view:
+        st.caption(f"Connected to: `{os.path.basename(db_path)}`")
+        
+        # Load Data
         df = load_table(db_path, table_name)
-    except Exception as e:
-        # Try to give a helpful hint if the table is missing
-        try:
-            uri = f"file:{quote(db_path, safe='/')}?mode=ro"
-            with sqlite3.connect(uri, uri=True) as conn:
-                tables = pd.read_sql_query(
-                    "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name;",
-                    conn,
-                )
-            hint = "Available tables: " + ", ".join(tables["name"].tolist()) if not tables.empty else "No tables found."
-        except Exception:
-            hint = ""
-        st.error(f"Failed to load table '{table_name}'. {hint}\n\nDetails: {e}")
-        st.stop()
+        
+        if df.empty:
+            st.info("The database is empty or the table 'EfrisPdfReport' was not found.")
+        else:
+            # Data Processing for Display
+            df["__ActivityDate"] = coerce_dates(df.get("Activity Date", pd.Series()))
+            df["__AmountNumeric"] = coerce_amount(df.get("Amount Assessed", pd.Series()))
 
-    # Normalize key columns
-    activity_col = "Activity Date"
-    amount_col = "Amount Assessed"
+            # Filters
+            c1, c2, c3 = st.columns(3)
+            with c1:
+                search_text = st.text_input("Search (TIN, Name, Assessment)", placeholder="Type to search...")
+            with c2:
+                if df["__ActivityDate"].notna().any():
+                    min_date, max_date = df["__ActivityDate"].min().date(), df["__ActivityDate"].max().date()
+                    date_range = st.date_input("Date Range", [min_date, max_date])
+            
+            # Apply Filters
+            filtered_df = df.copy()
+            if search_text:
+                mask = filtered_df.astype(str).apply(lambda x: x.str.contains(search_text, case=False)).any(axis=1)
+                filtered_df = filtered_df[mask]
+            
+            if isinstance(date_range, list) and len(date_range) == 2:
+                start, end = pd.Timestamp(date_range[0]), pd.Timestamp(date_range[1]) + pd.Timedelta(days=1)
+                filtered_df = filtered_df[(filtered_df["__ActivityDate"] >= start) & (filtered_df["__ActivityDate"] < end)]
 
-    if activity_col in df.columns:
-        df["__ActivityDate"] = coerce_dates(df[activity_col])
-    else:
-        st.warning(
-            f"Column '{activity_col}' not found. Date filtering disabled."
-        )
-        df["__ActivityDate"] = pd.NaT
+            # Metrics
+            m1, m2 = st.columns(2)
+            m1.metric("Total Records", len(filtered_df))
+            total_amt = filtered_df["__AmountNumeric"].sum()
+            m2.metric("Total Amount", f"{total_amt:,.2f}")
 
-    if amount_col in df.columns:
-        df["__AmountNumeric"] = coerce_amount(df[amount_col])
-    else:
-        df["__AmountNumeric"] = pd.NA
+            # Display
+            display_cols = [c for c in filtered_df.columns if not c.startswith("__")]
+            st.dataframe(filtered_df[display_cols], use_container_width=True, height=500)
 
-    # Apply filters
-    # Date range comes back either as a single date or a list [start, end]
-    start_d, end_d = None, None
-    if isinstance(date_range, list) and len(date_range) == 2:
-        start_d, end_d = date_range
-    elif isinstance(date_range, date):
-        start_d = end_d = date_range
+            # Download CSV
+            csv = filtered_df[display_cols].to_csv(index=False).encode('utf-8')
+            st.download_button("Download Filtered CSV", csv, "efris_report.csv", "text/csv")
 
-    if start_d and end_d and df["__ActivityDate"].notna().any():
-        start_ts = pd.Timestamp(start_d)
-        end_ts = pd.Timestamp(end_d) + pd.Timedelta(days=1) - pd.Timedelta(milliseconds=1)
-        df = df[(df["__ActivityDate"] >= start_ts) & (df["__ActivityDate"] <= end_ts)]
 
-    if tin_filter:
-        col = "TIN"
-        if col in df.columns:
-            df = df[df[col].astype(str).str.contains(tin_filter, case=False, na=False)]
+    # --- TAB 2: UPDATE FROM PDFS ---
+    with tab_update:
+        st.header("Update Database from PDFs")
+        st.markdown("Upload new EFRIS PDF reports here. They will be scanned, and valid data will be added to your current database session.")
 
-    if assess_filter:
-        col = "Assessment Number"
-        if col in df.columns:
-            df = df[df[col].astype(str).str.contains(assess_filter, case=False, na=False)]
+        uploaded_pdfs = st.file_uploader("Upload PDF Files", type=["pdf"], accept_multiple_files=True)
+        
+        if uploaded_pdfs:
+            if st.button(f"Process {len(uploaded_pdfs)} Files"):
+                with st.spinner("Extracting data and updating database..."):
+                    # Create a writable copy if we are using a read-only source? 
+                    # Actually, if we uploaded a DB, it's already a temp file we can write to.
+                    # If it's a local file (fallback), we should verify permissions.
+                    
+                    inserted, skipped, logs = process_pdfs_and_update_db(db_path, uploaded_pdfs)
+                    
+                    st.success(f"Processing Complete! Added: {inserted} | Skipped: {skipped}")
+                    
+                    with st.expander("View Processing Logs"):
+                        for log in logs:
+                            st.write(log)
+                    
+                    # Force reload of data in Tab 1
+                    load_table.clear()
+                    st.rerun()
 
-    # Summary metrics
-    total_rows = len(df)
-    total_amount = pd.to_numeric(df["__AmountNumeric"], errors="coerce").sum(min_count=1)
-
-    c1, c2, c3 = st.columns(3)
-    c1.metric("Rows", f"{total_rows:,}")
-    if pd.notna(total_amount):
-        c2.metric("Total Amount Assessed", f"{total_amount:,.2f}")
-    if activity_col in df.columns and df["__ActivityDate"].notna().any():
-        min_dt = df["__ActivityDate"].min()
-        max_dt = df["__ActivityDate"].max()
-        c3.metric("Data Date Range", f"{min_dt.date()} → {max_dt.date()}")
-
-    st.divider()
-    st.subheader("Results")
-
-    # Display table (hide helper columns)
-    display_cols = [c for c in df.columns if not c.startswith("__")]
-    st.dataframe(df[display_cols], use_container_width=True)
-
-    # CSV export
-    csv_bytes = df[display_cols].to_csv(index=False).encode("utf-8")
-    st.download_button(
-        label="Download CSV",
-        data=csv_bytes,
-        file_name="efris_report.csv",
-        mime="text/csv",
-    )
-
-    st.caption("Connected to: " + db_path)
-
+        st.divider()
+        st.subheader("Download Updated Database")
+        st.markdown("Once you have finished updating, download the new `.db` file to keep your changes.")
+        
+        # Read the current DB file to bytes for download
+        if db_path and os.path.exists(db_path):
+            with open(db_path, "rb") as f:
+                db_bytes = f.read()
+            
+            st.download_button(
+                label="Download Updated Database (.db)",
+                data=db_bytes,
+                file_name="EFRIS PDF Report_Updated.db",
+                mime="application/x-sqlite3"
+            )
 
 if __name__ == "__main__":
     main()
