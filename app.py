@@ -91,7 +91,7 @@ def extract_data_from_text(text):
     
     return data
 
-def process_pdfs_and_update_db(db_path, uploaded_pdfs):
+def process_pdfs_and_update_db(db_path, uploaded_pdfs, progress_callback=None):
     """
     Process list of uploaded PDF files, extract data, and insert into DB.
     Returns: (count_inserted, count_skipped, logs)
@@ -104,7 +104,10 @@ def process_pdfs_and_update_db(db_path, uploaded_pdfs):
     skipped_count = 0
     logs = []
 
-    for pdf_file in uploaded_pdfs:
+    total_files = len(uploaded_pdfs)
+    for i, pdf_file in enumerate(uploaded_pdfs):
+        if progress_callback:
+            progress_callback(i / total_files)
         text = extract_text_from_pdf(pdf_file)
         if not text:
             logs.append(f"❌ {pdf_file.name}: Could not extract text.")
@@ -291,14 +294,20 @@ def main():
         
         if uploaded_pdfs:
             if st.button(f"Process {len(uploaded_pdfs)} Files"):
-                with st.spinner("Extracting data and updating database..."):
-                    # Create a writable copy if we are using a read-only source? 
-                    # Actually, if we uploaded a DB, it's already a temp file we can write to.
-                    # If it's a local file (fallback), we should verify permissions.
-                    
-                    inserted, skipped, logs = process_pdfs_and_update_db(db_path, uploaded_pdfs)
-                    
-                    st.success(f"Processing Complete! Added: {inserted} | Skipped: {skipped}")
+                progress_bar = st.progress(0, text="Starting processing...")
+                
+                # Create a writable copy if we are using a read-only source? 
+                # Actually, if we uploaded a DB, it's already a temp file we can write to.
+                # If it's a local file (fallback), we should verify permissions.
+                
+                inserted, skipped, logs = process_pdfs_and_update_db(
+                    db_path, 
+                    uploaded_pdfs,
+                    progress_callback=lambda p: progress_bar.progress(p, text=f"Processing file {int(p * len(uploaded_pdfs)) + 1} of {len(uploaded_pdfs)}")
+                )
+                
+                progress_bar.progress(1.0, text="Finished!")
+                st.success(f"Processing Complete! Added: {inserted} | Skipped: {skipped}")
                     
                     with st.expander("View Processing Logs"):
                         for log in logs:
